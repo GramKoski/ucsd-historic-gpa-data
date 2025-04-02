@@ -55,7 +55,8 @@ const initDatabase = () => {
           `);
 
                     courseData.forEach(course => {
-                        // Parse department and course number
+                        // Improved parsing of department and course number
+                        // This will capture course numbers with letters like "20A"
                         const courseMatch = course.course.match(/^([A-Z]+)\s+([^\s-]+)/);
                         const department = courseMatch ? courseMatch[1] : null;
                         const courseNumber = courseMatch ? courseMatch[2] : null;
@@ -99,6 +100,7 @@ const initDatabase = () => {
                     db.run("CREATE INDEX idx_department ON courses (department)");
                     db.run("CREATE INDEX idx_term_year ON courses (term_year)");
                     db.run("CREATE INDEX idx_term_quarter ON courses (term_quarter)");
+                    db.run("CREATE INDEX idx_course_number ON courses (course_number)");
 
                     // Commit transaction
                     db.run("COMMIT", (err) => {
@@ -128,6 +130,23 @@ initDatabase().then(() => {
             }
             res.json(rows);
         });
+    });
+
+    // Get all courses for a department
+    app.get('/api/department/:dept/courses', (req, res) => {
+        const { dept } = req.params;
+
+        db.all(
+            "SELECT DISTINCT department, course_number, course FROM courses WHERE department = ? ORDER BY course_number",
+            [dept],
+            (err, rows) => {
+                if (err) {
+                    console.error(err);
+                    return res.status(500).json({ error: 'Database error' });
+                }
+                res.json(rows);
+            }
+        );
     });
 
     // Get GPA data for departments
@@ -201,6 +220,105 @@ initDatabase().then(() => {
 
             res.json(results);
         });
+    });
+
+    // Get GPA data for a specific course over time
+    app.post('/api/course/gpa', (req, res) => {
+        const { department, courseIdentifier, startYear, endYear } = req.body;
+
+        if (!department || !courseIdentifier) {
+            return res.status(400).json({ error: 'Department and course identifier must be specified' });
+        }
+
+        // Quarter mapping for sorting
+        const quarterOrder = "CASE term_quarter WHEN 'FA' THEN 0 WHEN 'WI' THEN 1 WHEN 'SP' THEN 2 ELSE 3 END";
+
+        const query = `
+      SELECT 
+        term_year as year,
+        term_quarter,
+        AVG(avg_gpa) as avg_gpa,
+        COUNT(*) as section_count,
+        SUM(enrolled) as total_enrolled
+      FROM courses
+      WHERE 
+        department = ? AND
+        course_number = ? AND
+        term_year >= ? AND
+        term_year <= ?
+      GROUP BY term_year, term_quarter
+      ORDER BY term_year, ${quarterOrder}
+    `;
+
+        db.all(query, [department, courseIdentifier, startYear, endYear], (err, rows) => {
+            if (err) {
+                console.error(err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            // Transform into the expected format
+            const quarterMap = { 'WI': 'Winter', 'SP': 'Spring', 'SU': 'Summer', 'FA': 'Fall', 'S1': 'Summer', 'S2': 'Summer', 'S3': 'Summer' };
+            const results = rows.map(row => {
+                const quarterName = quarterMap[row.term_quarter] || row.term_quarter;
+                const courseKey = `${department} ${courseIdentifier}`;
+
+                return {
+                    quarter: `${quarterName} ${row.year}`,
+                    year: row.year,
+                    quarterIndex: ['Winter', 'Spring', 'Summer', 'Fall'].indexOf(quarterName),
+                    avg_gpa: row.avg_gpa,
+                    section_count: row.section_count,
+                    total_enrolled: row.total_enrolled,
+                    // Use the courseKey for visualization compatibility
+                    [courseKey]: row.avg_gpa
+                };
+            });
+
+            // Sort by year and quarter
+            results.sort((a, b) => {
+                if (a.year !== b.year) return a.year - b.year;
+                return a.quarterIndex - b.quarterIndex;
+            });
+
+            res.json(results);
+        });
+    });
+
+    // Get course offerings to help users find course identifiers
+    app.get('/api/courses/search', (req, res) => {
+        const { query } = req.query;
+
+        if (!query || query.length < 2) {
+            return res.status(400).json({ error: 'Search query too short' });
+        }
+
+        const searchPattern = `%${query.toUpperCase()}%`;
+
+        db.all(
+            `SELECT DISTINCT department, course_number, course 
+             FROM courses 
+             WHERE UPPER(department) LIKE ? OR UPPER(course_number) LIKE ? OR UPPER(course) LIKE ?
+             ORDER BY department, course_number
+             LIMIT 50`,
+            [searchPattern, searchPattern, searchPattern],
+            (err, rows) => {
+                if (err) {
+                    console.error(err);
+                    return res.status(500).json({ error: 'Database error' });
+                }
+
+                // Format results to show course identifiers clearly
+                const results = rows.map(row => ({
+                    id: `${row.department}_${row.course_number}`,
+                    department: row.department,
+                    courseIdentifier: row.course_number,
+                    fullName: row.course,
+                    displayName: `${row.department} ${row.course_number} - ${row.course.split(' - ')[1] || ''}`
+                }));
+
+                res.json(results);
+            }
+        );
     });
 
     app.listen(PORT, () => {
